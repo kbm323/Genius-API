@@ -1,67 +1,42 @@
 import os
 import requests
-import json
-import re
 from fastapi import FastAPI, HTTPException
-from bs4 import BeautifulSoup
 
 app = FastAPI()
 
 GENIUS_TOKEN = os.getenv("GENIUS_ACCESS_TOKEN")
 
-def get_lyrics_from_embed(song_id: int):
+def get_lyrics_from_lrclib(title: str, artist: str, duration: int = None):
     """
-    일반 페이지 스크래핑이 막힐 때 사용하는 강력한 우회 방법입니다.
-    Genius의 '블로그 임베드(Embed)'용 자바스크립트 파일에서 가사를 추출합니다.
+    Genius가 막혔으므로, 차단 없는 오픈소스 API (LRCLIB)에서 가사를 가져옵니다.
     """
-    url = f"https://genius.com/songs/{song_id}/embed.js"
-    
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Referer': 'https://genius.com/'
-    }
-
     try:
-        # 1. 임베드 JS 파일 요청
-        response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
-        
-        # 2. 자바스크립트 코드 내에서 JSON 데이터 추출
-        # document.write(JSON.parse('...')) 형태에서 ... 부분만 발라냄
-        content = response.text
-        
-        # 정규표현식으로 JSON 문자열 찾기
-        match = re.search(r"JSON\.parse\('(.*?)'\)", content)
-        if not match:
-            print("Embed pattern not found")
-            return None
-            
-        # 이스케이프 문자 처리하여 JSON 로드
-        json_str = match.group(1).encode().decode('unicode-escape')
-        json_data = json.loads(json_str)
-        
-        # 3. HTML 추출
-        html_content = json_data.get('song', {}).get('lyrics_html')
-        if not html_content:
-            return None
-            
-        # 4. HTML에서 텍스트만 깔끔하게 정제
-        soup = BeautifulSoup(html_content, "html.parser")
-        
-        # 클릭해서 보는 주석(Annotation) 링크 제거
-        for a in soup.find_all("a"):
-            a.replace_with(a.get_text())
-            
-        lyrics_text = soup.get_text(separator="\n").strip()
-        return lyrics_text
+        # LRCLIB API 엔드포인트
+        url = "https://lrclib.net/api/get"
+        params = {
+            "artist_name": artist,
+            "track_name": title
+        }
+        if duration:
+            params["duration"] = duration
 
+        resp = requests.get(url, params=params, timeout=10)
+        
+        if resp.status_code == 200:
+            data = resp.json()
+            # plainLyrics(일반 가사)가 있으면 반환, 없으면 syncedLyrics(싱크 가사) 반환
+            return data.get("plainLyrics") or data.get("syncedLyrics")
+        else:
+            print(f"LRCLIB failed: {resp.status_code}")
+            return None
+            
     except Exception as e:
-        print(f"Embed Scraping Error: {e}")
+        print(f"LRCLIB Error: {e}")
         return None
 
 @app.get("/")
 def health_check():
-    return {"status": "online", "method": "embed_bypass"}
+    return {"status": "online", "mode": "Hybrid (Genius Meta + LRCLIB Text)"}
 
 @app.get("/search")
 def search_song(q: str):
@@ -70,7 +45,8 @@ def search_song(q: str):
     if not GENIUS_TOKEN:
         raise HTTPException(status_code=500, detail="GENIUS_ACCESS_TOKEN is missing")
 
-    # 1. 공식 API로 검색
+    # 1. [Genius] 공식 API로 메타데이터 검색 (제목, 가수, 이미지)
+    # Genius는 검색 능력과 이미지 화질이 가장 좋으므로 계속 사용합니다.
     try:
         search_url = "https://api.genius.com/search"
         headers = {"Authorization": f"Bearer {GENIUS_TOKEN}"}
@@ -78,35 +54,44 @@ def search_song(q: str):
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"API Error: {e}")
+        raise HTTPException(status_code=500, detail=f"Genius API Error: {e}")
 
     hits = data.get("response", {}).get("hits", [])
     if not hits:
-        return {"found": False, "message": "Song not found"}
+        return {"found": False, "message": "Song not found on Genius"}
 
-    # 2. 결과에서 ID와 URL 추출
+    # 가장 정확한 결과 가져오기
     top_hit = hits[0]["result"]
-    song_id = top_hit["id"]     # 여기서 ID를 가져옵니다 (예: 4734898)
-    song_url = top_hit["url"]
-    
-    # 3. 임베드 방식으로 가사 추출
-    print(f"Attempting embed fetch for ID: {song_id}")
-    lyrics_text = get_lyrics_from_embed(song_id)
+    genius_title = top_hit["title"]
+    genius_artist = top_hit["primary_artist"]["name"]
+    genius_url = top_hit["url"]
+    image_url = top_hit["song_art_image_url"]
 
-    if not lyrics_text:
+    # 2. [LRCLIB] 가사 텍스트 가져오기
+    # Genius에서 찾은 정확한 제목과 가수로 LRCLIB에 요청합니다.
+    print(f"Fetching lyrics for: {genius_title} by {genius_artist}")
+    lyrics_text = get_lyrics_from_lrclib(genius_title, genius_artist)
+
+    # 3. 결과 반환
+    if lyrics_text:
         return {
             "found": True,
-            "title": top_hit["title"],
-            "artist": top_hit["primary_artist"]["name"],
-            "lyrics": "Lyrics unavailable due to severe blocking.",
-            "lyrics_url": song_url,
-            "image_url": top_hit["song_art_image_url"]
+            "source": "LRCLIB", # 가사 출처 표시
+            "title": genius_title,
+            "artist": genius_artist,
+            "lyrics": lyrics_text,
+            "image_url": image_url,
+            "genius_link": genius_url
         }
-
-    return {
-        "found": True,
-        "title": top_hit["title"],
-        "artist": top_hit["primary_artist"]["name"],
-        "lyrics": lyrics_text,
-        "image_url": top_hit["song_art_image_url"]
-    }
+    else:
+        # LRCLIB에도 가사가 없는 경우 (매우 희귀한 곡 등)
+        # 텍스트는 못 주지만 링크는 줍니다.
+        return {
+            "found": True,
+            "source": "Genius Link Only",
+            "title": genius_title,
+            "artist": genius_artist,
+            "lyrics": "Lyrics text not available in database. Please check the link.",
+            "lyrics_url": genius_url, # 클릭해서 볼 수 있는 링크 제공
+            "image_url": image_url
+        }
