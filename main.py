@@ -46,7 +46,6 @@ def search_song(q: str):
         raise HTTPException(status_code=500, detail="GENIUS_ACCESS_TOKEN is missing")
 
     # 1. [Genius] 공식 API로 메타데이터 검색 (제목, 가수, 이미지)
-    # Genius는 검색 능력과 이미지 화질이 가장 좋으므로 계속 사용합니다.
     try:
         search_url = "https://api.genius.com/search"
         headers = {"Authorization": f"Bearer {GENIUS_TOKEN}"}
@@ -62,13 +61,15 @@ def search_song(q: str):
 
     # 가장 정확한 결과 가져오기
     top_hit = hits[0]["result"]
+    
+    # 📌 [수정됨] 여기서 ID를 추출합니다!
+    genius_id = top_hit["id"] 
     genius_title = top_hit["title"]
     genius_artist = top_hit["primary_artist"]["name"]
     genius_url = top_hit["url"]
     image_url = top_hit["song_art_image_url"]
 
     # 2. [LRCLIB] 가사 텍스트 가져오기
-    # Genius에서 찾은 정확한 제목과 가수로 LRCLIB에 요청합니다.
     print(f"Fetching lyrics for: {genius_title} by {genius_artist}")
     lyrics_text = get_lyrics_from_lrclib(genius_title, genius_artist)
 
@@ -76,7 +77,8 @@ def search_song(q: str):
     if lyrics_text:
         return {
             "found": True,
-            "source": "LRCLIB", # 가사 출처 표시
+            "id": genius_id,  # 📌 ID 추가됨
+            "source": "LRCLIB",
             "title": genius_title,
             "artist": genius_artist,
             "lyrics": lyrics_text,
@@ -84,14 +86,14 @@ def search_song(q: str):
             "genius_link": genius_url
         }
     else:
-        # LRCLIB에도 가사가 없는 경우 (매우 희귀한 곡 등)
-        # 텍스트는 못 주지만 링크는 줍니다.
+        # LRCLIB에 없는 경우
         return {
             "found": True,
+            "id": genius_id,  # 📌 ID 추가됨 (이걸로 n8n에서 Scrapfly 돌리면 됨)
             "source": "Genius Link Only",
             "title": genius_title,
             "artist": genius_artist,
             "lyrics": "Lyrics text not available in database. Please check the link.",
-            "lyrics_url": genius_url, # 클릭해서 볼 수 있는 링크 제공
+            "lyrics_url": genius_url,
             "image_url": image_url
         }
