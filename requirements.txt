@@ -1,3 +1,4 @@
 fastapi
 uvicorn
-lyricsgenius
+requests
+beautifulsoup4
