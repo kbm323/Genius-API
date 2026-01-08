@@ -1,95 +1,104 @@
 import os
 import requests
+import json
+import re
 from fastapi import FastAPI, HTTPException
 from bs4 import BeautifulSoup
 
 app = FastAPI()
 
-# 환경변수 가져오기
 GENIUS_TOKEN = os.getenv("GENIUS_ACCESS_TOKEN")
 
-def get_lyrics_scraping(url):
+def get_lyrics_from_embed(song_id: int):
     """
-    공식 API는 가사 텍스트를 안 주므로, URL로 접속해서 텍스트만 긁어오는 함수
+    일반 페이지 스크래핑이 막힐 때 사용하는 강력한 우회 방법입니다.
+    Genius의 '블로그 임베드(Embed)'용 자바스크립트 파일에서 가사를 추출합니다.
     """
-    # 봇 차단 방지용 헤더
+    url = f"https://genius.com/songs/{song_id}/embed.js"
+    
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
-        'Connection': 'keep-alive',
+        'Referer': 'https://genius.com/'
     }
-    
+
     try:
+        # 1. 임베드 JS 파일 요청
         response = requests.get(url, headers=headers, timeout=10)
         response.raise_for_status()
-    except Exception as e:
-        print(f"Scraping Error: {e}")
-        return None
-
-    soup = BeautifulSoup(response.text, 'html.parser')
-    
-    # Genius의 최신 가사 구조
-    lyrics_containers = soup.find_all("div", attrs={"data-lyrics-container": "true"})
-    
-    if not lyrics_containers:
-        return None
-
-    lyrics = ""
-    for container in lyrics_containers:
-        for br in container.find_all("br"):
-            br.replace_with("\n")
-        lyrics += container.get_text() + "\n\n"
         
-    return lyrics.strip()
+        # 2. 자바스크립트 코드 내에서 JSON 데이터 추출
+        # document.write(JSON.parse('...')) 형태에서 ... 부분만 발라냄
+        content = response.text
+        
+        # 정규표현식으로 JSON 문자열 찾기
+        match = re.search(r"JSON\.parse\('(.*?)'\)", content)
+        if not match:
+            print("Embed pattern not found")
+            return None
+            
+        # 이스케이프 문자 처리하여 JSON 로드
+        json_str = match.group(1).encode().decode('unicode-escape')
+        json_data = json.loads(json_str)
+        
+        # 3. HTML 추출
+        html_content = json_data.get('song', {}).get('lyrics_html')
+        if not html_content:
+            return None
+            
+        # 4. HTML에서 텍스트만 깔끔하게 정제
+        soup = BeautifulSoup(html_content, "html.parser")
+        
+        # 클릭해서 보는 주석(Annotation) 링크 제거
+        for a in soup.find_all("a"):
+            a.replace_with(a.get_text())
+            
+        lyrics_text = soup.get_text(separator="\n").strip()
+        return lyrics_text
+
+    except Exception as e:
+        print(f"Embed Scraping Error: {e}")
+        return None
 
 @app.get("/")
 def health_check():
-    return {
-        "status": "online", 
-        "token_configured": bool(GENIUS_TOKEN)
-    }
+    return {"status": "online", "method": "embed_bypass"}
 
 @app.get("/search")
 def search_song(q: str):
     if not q:
         raise HTTPException(status_code=400, detail="Query is required")
-    
     if not GENIUS_TOKEN:
-        raise HTTPException(status_code=500, detail="Server Error: GENIUS_ACCESS_TOKEN is missing")
+        raise HTTPException(status_code=500, detail="GENIUS_ACCESS_TOKEN is missing")
 
-    # 1. 공식 API로 곡 검색
-    search_url = "https://api.genius.com/search"
-    headers = {"Authorization": f"Bearer {GENIUS_TOKEN}"}
-    params = {"q": q}
-
+    # 1. 공식 API로 검색
     try:
-        response = requests.get(search_url, params=params, headers=headers, timeout=10)
-        
-        if response.status_code == 401:
-            raise HTTPException(status_code=401, detail="Invalid Access Token")
-            
-        response.raise_for_status()
-        data = response.json()
+        search_url = "https://api.genius.com/search"
+        headers = {"Authorization": f"Bearer {GENIUS_TOKEN}"}
+        resp = requests.get(search_url, params={"q": q}, headers=headers, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Genius API Error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"API Error: {e}")
 
     hits = data.get("response", {}).get("hits", [])
     if not hits:
         return {"found": False, "message": "Song not found"}
 
+    # 2. 결과에서 ID와 URL 추출
     top_hit = hits[0]["result"]
+    song_id = top_hit["id"]     # 여기서 ID를 가져옵니다 (예: 4734898)
     song_url = top_hit["url"]
     
-    # 2. 가사 긁어오기
-    lyrics_text = get_lyrics_scraping(song_url)
+    # 3. 임베드 방식으로 가사 추출
+    print(f"Attempting embed fetch for ID: {song_id}")
+    lyrics_text = get_lyrics_from_embed(song_id)
 
     if not lyrics_text:
         return {
             "found": True,
             "title": top_hit["title"],
             "artist": top_hit["primary_artist"]["name"],
-            "lyrics": "Lyrics text could not be extracted (Bot protection active).",
+            "lyrics": "Lyrics unavailable due to severe blocking.",
             "lyrics_url": song_url,
             "image_url": top_hit["song_art_image_url"]
         }
